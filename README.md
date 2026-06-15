@@ -1,7 +1,14 @@
 # Hybrid Predictive Architecture for Seismic Infrastructure Disruption
 
 **Operationalizing Governance as a Predictive Variable in Seismic Infrastructure Disruption**
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![scikit-learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?logo=scikit-learn&logoColor=white)](https://scikit-learn.org/)
+[![XGBoost](https://img.shields.io/badge/XGBoost-optional-lightgrey)](https://xgboost.readthedocs.io/)
+[![SHAP](https://img.shields.io/badge/SHAP-optional-lightgrey)](https://shap.readthedocs.io/)
+[![Reproducible](https://img.shields.io/badge/Reproducibility-Seed%2042-green)]()
 
+</div>
 ---
 
 ## 📋 Overview
@@ -229,7 +236,8 @@ If you use this work, please cite:
 
 ## 📜 License
 
-MIT License. Free for academic and research use with attribution.
+MIT License. free for academic and research use with attribution. See [LICENSE](LICENSE) for full text.
+
 
 ---
 
