@@ -227,7 +227,7 @@ If you use this work, please cite:
 @software{seismic_governance_2026,
   author = {Author Name},
   title = {Hybrid Predictive Architecture for Seismic Infrastructure Disruption},
-  year = {2024},
+  year = {2026},
   url = {https://github.com/aghiliarash/Hybrid_Predictive_Architecture_for_Seismic_Infrastructure_Disruption}
 }
 ```
