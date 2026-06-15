@@ -217,7 +217,7 @@ After running the pipeline, examine:
 If you use this work, please cite:
 
 ```bibtex
-@software{seismic_governance_2024,
+@software{seismic_governance_2026,
   author = {Author Name},
   title = {Hybrid Predictive Architecture for Seismic Infrastructure Disruption},
   year = {2024},
@@ -237,5 +237,5 @@ MIT License. Free for academic and research use with attribution.
 
 Questions or feedback? Please open a GitHub issue.
 
-**Last Updated:** 2024  
+**Last Updated:** 2026  
 **Maintainer:** aghiliarash
