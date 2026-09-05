@@ -168,14 +168,14 @@ Three complementary approaches are utilized to robustly understand feature impor
 ## ⚠️ Important Notes
 
 ### What This Is
-✅ A **simulation-calibrated proof-of-concept** for governance-inclusive machine learning  
-✅ A **computational transparency exercise** demonstrating method integration and signal recovery through non-linear noise
-✅ A **reproducible benchmark** for hypothesis testing at the simulation level
+- ✅ A **simulation-calibrated proof-of-concept** for governance-inclusive machine learning  
+- ✅ A **computational transparency exercise** demonstrating method integration and signal recovery through non-linear noise
+- ✅ A **reproducible benchmark** for hypothesis testing at the simulation level
 
 ### What This Is NOT
-❌ Empirical causal inference on real historical disruption events
-❌ An operational deployment tool ready for immediate field use without PMIS data linkage
-❌ A substitute for physical field data and engineering domain expertise
+- ❌ Empirical causal inference on real historical disruption events
+- ❌ An operational deployment tool ready for immediate field use without PMIS data linkage
+- ❌ A substitute for physical field data and engineering domain expertise
 
 ### Proper Use
 All inferences should be **strictly bounded to the calibrated simulation architecture.** The model coefficients and exact SHAP percentages represent computational relationships and model attributions within the specified DGP, not empirical estimates of real-world phenomena.
