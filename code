@@ -350,30 +350,25 @@ create_pipeline_figure()
 # 7. FEATURE SETS AND STRICT 70/15/15 SPLIT
 # =============================================================================
 
-model_features = [
-    "PGA", "PGV", "fault_distance_km", "soil_soft",
-    "approval_backlog", "contractor_mobilization_index", "active_approval_authorities",
-    "historical_downtime", "maintenance_late", "winter_season"
-]
-
 physical_features = ["PGA", "PGV", "fault_distance_km"]
 governance_features = ["approval_backlog", "contractor_mobilization_index", "active_approval_authorities"]
 vulnerability_context_features = ["historical_downtime", "maintenance_late", "soil_soft", "winter_season"]
+
+model_features = physical_features + governance_features + vulnerability_context_features
 physical_only_features = physical_features + vulnerability_context_features
 
 X = df[model_features]
 y_class = df["prolonged_disruption"]
 y_reg = df["downtime_days"]
 
-# Classification Split: 70% Train, 15% Validation, 15% Holdout Test
-X_temp, X_test, y_temp_class, y_test = train_test_split(X, y_class, test_size=0.15, stratify=y_class, random_state=RANDOM_SEED)
-X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp_class, test_size=0.1765, stratify=y_temp_class, random_state=RANDOM_SEED)
+# Classification Split: 85% Train (with 10-fold CV), 15% Independent Holdout Test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_class, test_size=0.15, stratify=y_class, random_state=RANDOM_SEED
+)
 
 # Regression Targets strictly aligned to Classification indices
 y_train_reg = y_reg.loc[X_train.index]
-y_val_reg = y_reg.loc[X_val.index]
 y_test_reg = y_reg.loc[X_test.index]
-
 
 # =============================================================================
 # 8. CLASSIFICATION MODEL BENCHMARK
@@ -423,7 +418,6 @@ for model_name, model in classification_models.items():
     print(f"{model_name:<15} | {holdout_acc:.3f}  | {holdout_auc:.3f}  | {holdout_f1:.3f}")
 
 safe_to_csv(pd.DataFrame(classification_results), "Classification_Model_Benchmark.csv", index=False)
-
 
 # =============================================================================
 # 9. PRIMARY MODEL SELECTION
