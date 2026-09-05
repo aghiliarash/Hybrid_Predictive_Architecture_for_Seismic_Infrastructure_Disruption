@@ -1,4 +1,4 @@
-# Hybrid Predictive Architecture for Seismic Infrastructure Disruption
+# Governance-Aware Machine Learning for Post-Disaster Infrastructure Recovery
 
 **Operationalizing Governance as a Predictive Variable in Seismic Infrastructure Disruption**
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -84,31 +84,24 @@ The pipeline generates:
 
 ### 1. **Data-Generating Process (DGP)**
 
-The continuous downtime outcome is generated as a transparent linear structural model:
+The continuous downtime outcome is generated as a transparent, non-linear structural model that compounds administrative delays conditionally based on physical damage:
 
 ```
-downtime_days = β₀ + Σ(βᵢ × zᵢ) + interactions + ε
+D_i = max(0.5, 9.0 + 1.65×z(PGA) + 0.85×z(PGV) - 0.70×z(FD) + Governance_Penalty + Interactions + ε)
 
 where:
-  β₀ = 9.0 (operational baseline)
-  zᵢ = standardized feature i
-  ε ~ N(0, 1.25²) (measurement noise)
+  Governance_Penalty establishes a hard non-linear discontinuity:
+    If z(PGA) > 0.50 (Severe Damage): 
+       Penalty = 1.80×z(AB) - 1.20×z(CMI) + 0.50×[z(AB) × z(AA)]
+    Else (Minor Damage): 
+       Penalty = 0.40×z(AB) - 0.30×z(CMI) + 0.10×z(AA)
+
+  ε ~ N(0, 1.25²) (unobserved random disturbance)
 ```
-
-**Physical Effects:**
-- PGA (1.65), PGV (0.85), fault distance (-0.70), soil softness (0.30)
-
-**Governance Effects:**
-- Approval backlog (1.35), contractor mobilization (-1.10), historical downtime (0.75), active authorities (0.45)
-
-**Interactions:**
-- PGA × soil softness (0.55) — amplification in soft soil
-- Approval backlog × active authorities (0.45) — coordination burden
-- Contractor mobilization × approval backlog (-0.40) — readiness mitigates delays
 
 ### 2. **Feature Generation via Gaussian Copulas**
 
-Physical and governance variables are generated with specified correlation structures to preserve realistic dependencies:
+Physical and governance variables are generated with specified correlation structures to preserve realistic dependencies across the simulation space:
 
 ```
 Target Physical Correlation:
@@ -128,79 +121,77 @@ Target Governance Correlation:
 
 ### 3. **Model Pipeline**
 
-The pipeline benchmarks multiple architectures:
+The pipeline benchmarks multiple architectures, maintaining a strict validation split to prevent data leakage:
 
 | Model | Type | Role |
 |-------|------|------|
-| **GBM-Fortify** | Classification | Primary model — regularized for stability |
-| GBM | Classification | Baseline gradient boosting |
+| **Tuned-GBM** | Classification | Primary model — regularized for stability |
+| GBM | Classification | Baseline unconstrained gradient boosting |
 | Random Forest | Classification | Ensemble alternative |
 | XGBoost | Classification | Accelerated boosting (if available) |
 
-**Primary Model Selection:** GBM-Fortify is regularized for manuscript reproducibility:
-- Learning rate: 0.03 (conservative)
+**Primary Model Selection:** The *Tuned-GBM* is highly regularized for manuscript reproducibility and to prevent overfitting to the synthetic noise:
+- Learning rate: 0.03
 - Max depth: 3 (shallow trees)
-- Min samples per leaf: 5 (prevent overfitting)
+- Min samples per leaf: 5
 - 300 estimators with 0.8 subsampling
 
 ### 4. **Interpretability Analysis**
 
-Three complementary approaches to understand feature importance:
+Three complementary approaches are utilized to robustly understand feature importance:
 
-1. **Permutation Importance** — Accuracy drop when feature is shuffled
-2. **SHAP Values** — Shapley additive explanations per prediction
-3. **Feature Ablation** — Hybrid vs. physical-only model comparison
+1. **Permutation Importance** — Accuracy drop when individual features are shuffled
+2. **SHAP Values** —  Exact Shapley additive explanations (TreeExplainer) per prediction
+3. **Feature Ablation** — Hybrid vs. Physical-only baseline model comparison
 
 ---
 
 ## 📊 Key Features
 
 ### Data Diversity
-- **500 synthetic scenarios** with realistic correlation structures
-- **10 feature groups** spanning hazard, governance, and context
-- **Binary target** (prolonged disruption) and continuous outcome (downtime days)
+- **1000 synthetic scenarios** with realistic, multi-variate correlation structures
+- **10 feature groups** spanning physical hazards, administrative governance, and infrastructure context
+- **Binary target** (prolonged disruption > 9 days) and continuous evaluation outcome (downtime days)
 
 ### Interpretability-First Design
-- ✅ Transparent DGP — all coefficients specified and documented
-- ✅ No black-box tuning — deterministic correlation matrices and distributions
-- ✅ Multiple validation approaches — SHAP, permutation, ablation
-- ✅ Reproducible — fixed random seed, deterministic outputs
+- ✅ **Transparent DGP** — all coefficients and conditional step-functions strictly documented
+- ✅ **No black-box tuning** — deterministic correlation matrices and distributions
+- ✅ **Robust validation** — strict 85/15 split, 10-fold CV on the development set, plus SHAP, permutation, and ablation on the independent holdout
+- ✅ **Reproducible** — fixed random seeds and deterministic outputs
 
 ### Institutional Validity
-- Governance variables calibrated to megaproject literature
-- Physical parameters matched to seismic catalogs (İzmit 1999 baseline)
-- Interaction terms grounded in infrastructure disruption theory
+- Governance parameters heuristically calibrated to megaproject literature and field reports (e.g., AFAD 2023)
+- Physical parameters calibrated to regional seismic catalogs (EAFZ / 2023 Kahramanmaraş context)
 
 ---
 
 ## ⚠️ Important Notes
 
 ### What This Is
-✅ A **simulation-calibrated proof-of-concept** for governance-inclusive ML  
-✅ A **computational transparency exercise** demonstrating method integration  
-✅ A **reproducible benchmark** for hypothesis testing at the simulation level  
+✅ A **simulation-calibrated proof-of-concept** for governance-inclusive machine learning  
+✅ A **computational transparency exercise** demonstrating method integration and signal recovery through non-linear noise
+✅ A **reproducible benchmark** for hypothesis testing at the simulation level
 
 ### What This Is NOT
-❌ Empirical causal inference on real disruption events  
-❌ Operational deployment model without external validation  
-❌ Substitute for field data and domain expertise  
+❌ Empirical causal inference on real historical disruption events
+❌ An operational deployment tool ready for immediate field use without PMIS data linkage
+❌ A substitute for physical field data and engineering domain expertise
 
 ### Proper Use
-All inferences should be **bounded to the calibrated simulation architecture**. The model coefficients represent computational relationships in the DGP, not empirical estimates of real-world effects.
+All inferences should be **strictly bounded to the calibrated simulation architecture.** The model coefficients and exact SHAP percentages represent computational relationships and model attributions within the specified DGP, not empirical estimates of real-world phenomena.
 
 ---
 
 ## 📈 Expected Outputs
 
-After running the pipeline, examine:
-
-1. **Classification_Model_Benchmark.csv** — Model performance comparison
-2. **GBM-Fortify_Permutation_Importance_All_Features.csv** — Feature rankings
-3. **GBM-Fortify_SHAP_MeanAbs_Importance.csv** — SHAP-based importance
-4. **GBM-Fortify_Feature_Ablation_Test.csv** — Governance uplift over physical-only
-5. **GBM-Fortify_SHAP_Category_Shares.csv** — Governance vs. physical vs. contextual split
-6. **Synthetic_Disruption_Scenarios.csv** — Full dataset for external analysis
-7. **Figure_*.png** — Correlation heatmaps and SHAP visualizations
+After running the pipeline, examine the model_outputs/ directory for:
+1. **Classification_Model_Benchmark.csv** — Model performance comparison across architectures
+2. **Tuned-GBM_Permutation_Importance_All_Features.csv** — Feature rankings by holdout accuracy drop
+3. **Tuned-GBM_SHAP_MeanAbs_Importance.csv** — SHAP-based absolute importance rankings
+4. **Tuned-GBM_Feature_Ablation_Test.csv** — Governance accuracy uplift over the physical-only baseline
+5. **Tuned-GBM_SHAP_Category_Shares.csv** — Normalized categorical split (Governance vs. Physical vs. Contextual)
+6. **Synthetic_Disruption_Scenarios.csv** — Full 10,000 scenario dataset for external analysis
+7. **Figure_*.png** — High-resolution correlation heatmaps and SHAP beeswarm plots
 
 ---
 
@@ -208,26 +199,24 @@ After running the pipeline, examine:
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| N_SCENARIOS | 500 | Sample size for simulation |
-| RANDOM_SEED | 42 | Reproducibility |
-| Test split | 20% | Holdout evaluation |
-| CV folds | 10 | Stratified K-fold |
-| Primary model learning rate | 0.03 | Conservative for stability |
-| Primary model max_depth | 3 | Prevent overfitting |
-| Min samples leaf | 5 | Regularization |
-| Noise scale (σ) | 1.25 | DGP stochasticity |
+| N_SCENARIOS | 1000 | Scaled sample size for robust simulation |
+| RANDOM_SEED | 42 | Guaranteed reproducibility |
+| Test split | 15% | Independent Holdout evaluation |
+| CV folds | 10 | Stratified K-fold performed exclusively on the 85% development set |
+| Primary model learning rate | 0.03 | Conservative learning rate for the Tuned-GBM |
 
 ---
 
 ## 📚 Citation
 
-If you use this work, please cite:
+If you utilize this pipeline or framework, please cite the associated manuscript:
 
 ```bibtex
-@software{seismic_governance_2026,
-  author = {Author Name},
-  title = {Hybrid Predictive Architecture for Seismic Infrastructure Disruption},
+@article{aghili_ugural_2026,
+  author = {Aghili, Seyedarash and Uğural, Mehmet Nurettin},
+  title = {Governance-Aware Machine Learning for Post-Disaster Infrastructure Recovery: A Synthetic Proof-of-Concept},
   year = {2026},
+  journal = {Pending Publication},
   url = {https://github.com/aghiliarash/Hybrid_Predictive_Architecture_for_Seismic_Infrastructure_Disruption}
 }
 ```
