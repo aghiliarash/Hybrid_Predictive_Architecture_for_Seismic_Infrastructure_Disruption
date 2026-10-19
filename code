@@ -1,594 +1,496 @@
+#!/usr/bin/env python3
 """
-Final Reproducibility Pipeline
-Hybrid Seismic Infrastructure Disruption Forecasting
+Post-Disaster Railway Infrastructure Recovery Analysis (Leak-Free and Non-Circular)
+Case study: 2023 Kahramanmaras earthquake sequence, Turkiye
 
-Primary model:
-    Tuned-GBM (Regularized Gradient Boosting Machine)
+Self-contained replication script (version 2, includes robustness checks).
+Dependencies: numpy, pandas, scipy, matplotlib.
+Usage:  python 05_final_model_and_figures.py [data.csv] [output_dir]
 
-Purpose:
-    1. Generate correlated physical and governance features using Gaussian copulas.
-    2. Generate continuous downtime using a highly non-linear, threshold-based DGP.
-    3. Create binary prolonged-disruption target.
-    4. Benchmark GBM, Tuned-GBM, Random Forest, and XGBoost (if available).
-    5. Select Tuned-GBM as the primary model.
-    6. Run SHAP, permutation importance, and feature ablation.
-    7. Export all tables and figures for manuscript reproducibility.
-
-Important:
-    - The simulation is a transparent computational experiment, scaled to N=10,000.
-    - The DGP utilizes non-linear institutional thresholds rather than linear tautologies.
-    - Coefficients/Outputs are not empirical causal estimates but methodological proofs-of-concept.
+It reproduces every numerical result reported in the article and its supplement:
+  1. Descriptive statistics and Spearman associations
+  2. Leave-one-corridor-out (LOCO) Random Forest benchmarks (Regime A and Regime B)
+  3. Decision Stump and Two-Stage Hurdle comparators (including retransformation variants)
+  4. Segment-level and cluster-block bootstrap intervals (1,000 resamples, seed 42)
+  5. Out-of-fold (frozen-model) permutation importance and global-refitting importance
+  6. Milestone, hyperparameter and multi-seed sensitivity analyses
+  7. Full-register L2 logit, univariate probit fragility fits and fit measures
+  8. Robustness checks: training-mean baseline and skill scores, exact corridor-label
+     permutation test for the triage rule, intra-corridor correlation and effective sample size,
+     and leave-two-corridors-out validation
+  9. 300 dpi figures (PNG and PDF)
+Permutation convention: each predictor column is permuted across all 51 segments, and the
+frozen fold models are re-scored on their held-out corridors.
 """
-
-# =============================================================================
-# 0. IMPORTS AND GLOBAL SETTINGS
-# =============================================================================
-
-import os
-import warnings
-warnings.filterwarnings("ignore")
-
+import os, sys, itertools
 import numpy as np
 import pandas as pd
+from scipy import optimize, stats
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from matplotlib.patches import FancyBboxPatch, ConnectionPatch
-
-from scipy.stats import (
-    norm, lognorm, truncnorm, nbinom, 
-    gamma, poisson, bernoulli, uniform
-)
-
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
-from sklearn.ensemble import (
-    GradientBoostingClassifier, GradientBoostingRegressor,
-    RandomForestClassifier, RandomForestRegressor
-)
-from sklearn.metrics import (
-    accuracy_score, roc_auc_score, f1_score, 
-    mean_squared_error, mean_absolute_error, r2_score
-)
-from sklearn.inspection import permutation_importance
-
-# Optional XGBoost integration
-try:
-    from xgboost import XGBClassifier, XGBRegressor
-    XGBOOST_AVAILABLE = True
-except ImportError:
-    XGBOOST_AVAILABLE = False
-
-# Optional SHAP integration
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    SHAP_AVAILABLE = False
-
-
-# Global Constants
-RANDOM_SEED = 42
-N_SCENARIOS = 10000  # Scaled for robust generalization
-OUTPUT_DIR = "model_outputs"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-rng = np.random.default_rng(RANDOM_SEED)
-
-
-# =============================================================================
-# 1. UTILITY FUNCTIONS
-# =============================================================================
-
-def nearest_positive_definite(corr):
-    """Ensures that a correlation matrix is strictly positive definite."""
-    corr = np.asarray(corr, dtype=float)
-    eigvals, eigvecs = np.linalg.eigh(corr)
-    eigvals[eigvals < 1e-8] = 1e-8
-    corr_pd = eigvecs @ np.diag(eigvals) @ eigvecs.T
-    d = np.sqrt(np.diag(corr_pd))
-    corr_pd = corr_pd / np.outer(d, d)
-    return corr_pd
-
-def gaussian_copula_samples(n, corr, random_state=42):
-    """Generates correlated uniform samples using a Gaussian copula."""
-    local_rng = np.random.default_rng(random_state)
-    corr_pd = nearest_positive_definite(corr)
-    z = local_rng.multivariate_normal(mean=np.zeros(corr_pd.shape[0]), cov=corr_pd, size=n)
-    return norm.cdf(z)
-
-def zscore(x):
-    """Standardizes an array to zero mean and unit variance."""
-    x = np.asarray(x)
-    return (x - np.mean(x)) / np.std(x, ddof=1)
-
-def rmse(y_true, y_pred):
-    """Calculates Root Mean Square Error."""
-    return np.sqrt(mean_squared_error(y_true, y_pred))
-
-def safe_to_csv(df, filename, **kwargs):
-    """Saves DataFrame to CSV, with fallback handling for permission errors."""
-    path = os.path.join(OUTPUT_DIR, filename)
-    kwargs.setdefault("encoding", "utf-8-sig")
-    try:
-        df.to_csv(path, **kwargs)
-        return path
-    except PermissionError:
-        base, ext = os.path.splitext(filename)
-        fallback = os.path.join(OUTPUT_DIR, f"{base}_fallback{ext}")
-        df.to_csv(fallback, **kwargs)
-        return fallback
-
-def save_correlation_heatmap(corr_df, title, filename):
-    """Generates and saves a high-resolution Spearman correlation heatmap."""
-    labels = corr_df.columns.tolist()
-    values = corr_df.values
-    fig, ax = plt.subplots(figsize=(7, 6))
-    im = ax.imshow(values, vmin=-1, vmax=1, cmap="coolwarm")
-    
-    ax.set_xticks(np.arange(len(labels)))
-    ax.set_yticks(np.arange(len(labels)))
-    ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.set_yticklabels(labels)
-    
-    for i in range(values.shape[0]):
-        for j in range(values.shape[1]):
-            ax.text(j, i, f"{values[i, j]:.2f}", ha="center", va="center", fontsize=9, color="black")
-            
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    fig.colorbar(im, ax=ax, label="Spearman Correlation")
-    fig.tight_layout()
-    fig.savefig(os.path.join(OUTPUT_DIR, filename), dpi=600, bbox_inches="tight")
-    plt.close(fig)
-
-def draw_box(ax, xy, width, height, text, fontsize=9):
-    """Helper to draw a styled box for the pipeline architecture figure."""
-    box = FancyBboxPatch(
-        xy, width, height, boxstyle="round,pad=0.15,rounding_size=0.15", 
-        linewidth=1.0, edgecolor="black", facecolor="#F7F7F7", mutation_scale=2, zorder=2
-    )
-    ax.add_patch(box)
-    ax.text(xy[0] + width / 2, xy[1] + height / 2, text, ha="center", va="center", 
-            fontsize=fontsize, family="serif", wrap=True)
-    return box
-
-def draw_arrow(ax, start, end, text=None, text_offset=(0, 0), fontsize=8):
-    """Helper to draw a styled connection arrow for the pipeline architecture figure."""
-    arrow = ConnectionPatch(
-        xyA=start, coordsA="data", xyB=end, coordsB="data", 
-        arrowstyle="-|>,head_length=6,head_width=4", linewidth=1.0, color="black", 
-        shrinkA=0, shrinkB=0, mutation_scale=10, zorder=1
-    )
-    ax.add_artist(arrow)
-    if text:
-        ax.text((start[0] + end[0]) / 2 + text_offset[0], (start[1] + end[1]) / 2 + text_offset[1], 
-                text, ha="center", va="center", fontsize=fontsize, family="serif", 
-                backgroundcolor="#FFFFFF")
-    return arrow
-
-def create_pipeline_figure(output_dir=OUTPUT_DIR, filename_base="Figure_Pipeline_Architecture"):
-    """Generates the conceptual flowchart of the methodology."""
-    plt.rcParams.update({
-        "font.family": "serif", "font.serif": ["Times New Roman", "Georgia", "serif"], 
-        "font.size": 8, "axes.titlesize": 10, "axes.labelsize": 9, 
-        "xtick.labelsize": 8, "ytick.labelsize": 8, "figure.dpi": 300, 
-        "savefig.dpi": 600, "figure.titlesize": 12
-    })
-
-    fig = plt.figure(figsize=(10.5, 9.0))
-    fig.subplots_adjust(wspace=0.15, hspace=0.35, left=0.05, right=0.98, top=0.95, bottom=0.05)
-    
-    panel_layout = [
-        (0.05, 0.52, "A", "Data Inputs & Calibration"),
-        (0.52, 0.52, "B", "Simulation & Target Definition"),
-        (0.05, 0.05, "C", "Machine Learning Architecture"),
-        (0.52, 0.05, "D", "Validation & Application")
-    ]
-
-    for x0, y0, panel_label, title in panel_layout:
-        panel_ax = fig.add_axes([x0, y0, 0.44, 0.42])
-        panel_ax.axis("off")
-        panel_ax.text(0.0, 1.02, panel_label, transform=panel_ax.transAxes, fontsize=12, fontweight="bold", family="serif")
-        panel_ax.text(0.02, 0.92, title, transform=panel_ax.transAxes, fontsize=9, fontweight="bold", family="serif", va="top")
-
-        if panel_label == "A":
-            draw_box(panel_ax, (0.08, 0.55), 0.38, 0.28, "Physical Hazard Telemetry\n(EAFZ Dataset, AFAD API)")
-            draw_box(panel_ax, (0.55, 0.55), 0.38, 0.28, "Governance State Records\n(AFAD 2023 Archives)")
-            draw_arrow(panel_ax, (0.46, 0.69), (0.55, 0.69), text="Parameterization", text_offset=(0, 0.03))
-        elif panel_label == "B":
-            draw_box(panel_ax, (0.05, 0.55), 0.26, 0.28, "Monte Carlo Scenario Gen.\n(Gaussian Copula)")
-            draw_box(panel_ax, (0.37, 0.55), 0.26, 0.28, "DGP Non-Linear Function\n(Continuous Downtime)")
-            draw_box(panel_ax, (0.69, 0.55), 0.26, 0.28, "Target Binarization\n(>9 Days Threshold)")
-            draw_arrow(panel_ax, (0.31, 0.69), (0.37, 0.69))
-            draw_arrow(panel_ax, (0.63, 0.69), (0.69, 0.69))
-        elif panel_label == "C":
-            draw_box(panel_ax, (0.08, 0.55), 0.38, 0.28, "Socio-Technical Feature Set\n(Physical + Governance variables)")
-            draw_box(panel_ax, (0.55, 0.55), 0.38, 0.28, "Model Training & Tuning\n(Tuned-GBM, 70/15/15 Split)")
-            draw_arrow(panel_ax, (0.46, 0.69), (0.55, 0.69))
-        elif panel_label == "D":
-            draw_box(panel_ax, (0.05, 0.6), 0.35, 0.23, "Performance Validation\n(F1, AUC, RMSE) & SHAP")
-            draw_box(panel_ax, (0.325, 0.2), 0.35, 0.23, "Distributional Robustness Testing")
-            draw_box(panel_ax, (0.65, 0.4), 0.3, 0.23, "Output: Conceptual Decision\nSupport Architecture")
-            draw_arrow(panel_ax, (0.4, 0.6), (0.4, 0.43))
-            draw_arrow(panel_ax, (0.55, 0.31), (0.65, 0.51))
-
-    fig.text(0.5, 0.01, "Pipeline illustration for manuscript-style figure production.", ha="center", fontsize=8, family="serif")
-    for ext in ["pdf", "png", "tiff"]:
-        fig.savefig(os.path.join(output_dir, f"{filename_base}.{ext}"), dpi=600, bbox_inches="tight")
-    plt.close(fig)
-
-def safe_shap_values(model, X):
-    """Calculates robust exact Shapley values."""
-    if not SHAP_AVAILABLE:
-        raise ImportError("SHAP is not installed.")
-    explainer = shap.TreeExplainer(model)
-    values = explainer.shap_values(X)
-    if isinstance(values, list):
-        values = values[1]
-    return values
-
-
-# =============================================================================
-# 2. COPULA CORRELATION MATRICES
-# =============================================================================
-
-# Define Target Rank Correlations (Spearman)
-physical_corr_target = np.array([
-    [1.00, -0.55,  0.65,  0.58],
-    [-0.55, 1.00, -0.60, -0.52],
-    [0.65, -0.60,  1.00,  0.82],
-    [0.58, -0.52,  0.82,  1.00]
-])
-physical_corr_labels = ["Mw", "fault_distance_km", "PGA", "PGV"]
-
-governance_corr_target = np.array([
-    [1.00, -0.35,  0.40,  0.45],
-    [-0.35, 1.00, -0.30, -0.25],
-    [0.40, -0.30,  1.00,  0.30],
-    [0.45, -0.25,  0.30,  1.00]
-])
-governance_corr_labels = ["approval_backlog", "contractor_mobilization_index", "historical_downtime", "active_approval_authorities"]
-
-safe_to_csv(pd.DataFrame(physical_corr_target, index=physical_corr_labels, columns=physical_corr_labels), "Target_Physical_Copula_Correlation.csv")
-safe_to_csv(pd.DataFrame(governance_corr_target, index=governance_corr_labels, columns=governance_corr_labels), "Target_Governance_Copula_Correlation.csv")
-
-
-# =============================================================================
-# 3. SCENARIO GENERATION (N=10,000)
-# =============================================================================
-
-print(f"\n[INFO] Generating {N_SCENARIOS} simulated disruption scenarios...")
-
-# Physical Sampling
-u_phys = gaussian_copula_samples(n=N_SCENARIOS, corr=physical_corr_target, random_state=RANDOM_SEED)
-Mw = truncnorm.ppf(u_phys[:, 0], a=(5.0 - 6.3)/0.55, b=(7.5 - 6.3)/0.55, loc=6.3, scale=0.55)
-fault_distance_km = lognorm.ppf(u_phys[:, 1], s=0.45, scale=np.exp(np.log(35)))
-PGA = lognorm.ppf(u_phys[:, 2], s=0.35, scale=np.exp(np.log(0.22)))
-PGV = lognorm.ppf(u_phys[:, 3], s=0.40, scale=np.exp(np.log(22)))
-
-# Governance Sampling
-u_gov = gaussian_copula_samples(n=N_SCENARIOS, corr=governance_corr_target, random_state=RANDOM_SEED + 1)
-approval_backlog = nbinom.ppf(u_gov[:, 0], n=3, p=0.4).astype(int)
-contractor_mobilization_index = uniform.ppf(u_gov[:, 1], loc=0.4, scale=0.5)
-historical_downtime = gamma.ppf(u_gov[:, 2], a=2.1, scale=1.8)
-active_approval_authorities = poisson.ppf(u_gov[:, 3], mu=4.2).astype(int)
-
-# Contextual Sampling
-event_season = rng.integers(1, 5, size=N_SCENARIOS)
-winter_season = np.where(event_season == 1, 1, 0)
-maintenance_late = bernoulli.rvs(0.35, size=N_SCENARIOS, random_state=RANDOM_SEED + 2)
-soil_class = rng.choice([0, 1, 2], size=N_SCENARIOS, p=[0.35, 0.45, 0.20])
-soil_soft = np.where(soil_class == 2, 1, 0)
-
-
-# =============================================================================
-# 4. NON-LINEAR DATA-GENERATING PROCESS (DGP)
-# =============================================================================
-
-# Standardize variables for DGP processing
-z_PGA, z_PGV, z_FD = zscore(PGA), zscore(PGV), zscore(fault_distance_km)
-z_AB, z_CMI, z_HD, z_AA = zscore(approval_backlog), zscore(contractor_mobilization_index), zscore(historical_downtime), zscore(active_approval_authorities)
-
-epsilon = rng.normal(loc=0.0, scale=1.25, size=N_SCENARIOS)
-
-# Non-linear threshold: Governance bottlenecks compound severely ONLY IF physical damage is high
-governance_penalty = np.where(
-    z_PGA > 0.5,
-    (1.80 * z_AB) - (1.20 * z_CMI) + (0.50 * (z_AB * z_AA)), # Severe Bottleneck
-    (0.40 * z_AB) - (0.30 * z_CMI) + (0.10 * z_AA)           # Minor Frictional Delay
-)
-
-downtime_days = (
-    9.0
-    + 1.65 * z_PGA
-    + 0.85 * z_PGV
-    - 0.70 * z_FD
-    + governance_penalty
-    + 0.75 * z_HD
-    + 0.35 * maintenance_late
-    + 0.30 * soil_soft
-    + 0.25 * winter_season
-    + 0.55 * (z_PGA * soil_soft) # Physical Interaction (Liquefaction)
-    + epsilon
-)
-
-downtime_days = np.maximum(downtime_days, 0.5)
-prolonged_disruption = (downtime_days > 9.0).astype(int)
-
-
-# =============================================================================
-# 5. BUILD DATAFRAME AND EXPORT SCENARIOS
-# =============================================================================
-
-df = pd.DataFrame({
-    "Mw": Mw, "PGA": PGA, "PGV": PGV, "fault_distance_km": fault_distance_km,
-    "soil_soft": soil_soft, "approval_backlog": approval_backlog,
-    "contractor_mobilization_index": contractor_mobilization_index,
-    "historical_downtime": historical_downtime,
-    "active_approval_authorities": active_approval_authorities,
-    "maintenance_late": maintenance_late, "winter_season": winter_season,
-    "downtime_days": downtime_days, "prolonged_disruption": prolonged_disruption
-})
-
-safe_to_csv(df, "Synthetic_Disruption_Scenarios.csv", index=False)
-
-
-# =============================================================================
-# 6. CORRELATION VALIDATION AND FIGURES
-# =============================================================================
-
-print("\n[INFO] Validating and saving Copula correlations...")
-realized_physical_corr = df[["Mw", "fault_distance_km", "PGA", "PGV"]].corr(method="spearman")
-realized_governance_corr = df[["approval_backlog", "contractor_mobilization_index", "historical_downtime", "active_approval_authorities"]].corr(method="spearman")
-
-safe_to_csv(realized_physical_corr, "Realized_Physical_Spearman_Correlation.csv")
-safe_to_csv(realized_governance_corr, "Realized_Governance_Spearman_Correlation.csv")
-
-save_correlation_heatmap(realized_physical_corr, "Realized Physical Hazard Spearman Correlation", "Figure_Physical_Copula_Realized_Correlation.png")
-save_correlation_heatmap(realized_governance_corr, "Realized Governance Spearman Correlation", "Figure_Governance_Copula_Realized_Correlation.png")
-create_pipeline_figure()
-
-
-# =============================================================================
-# 7. FEATURE SETS AND STRICT 70/15/15 SPLIT
-# =============================================================================
-
-physical_features = ["PGA", "PGV", "fault_distance_km"]
-governance_features = ["approval_backlog", "contractor_mobilization_index", "active_approval_authorities"]
-vulnerability_context_features = ["historical_downtime", "maintenance_late", "soil_soft", "winter_season"]
-
-model_features = physical_features + governance_features + vulnerability_context_features
-physical_only_features = physical_features + vulnerability_context_features
-
-X = df[model_features]
-y_class = df["prolonged_disruption"]
-y_reg = df["downtime_days"]
-
-# Classification Split: 85% Train (with 10-fold CV), 15% Independent Holdout Test
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y_class, test_size=0.15, stratify=y_class, random_state=RANDOM_SEED
-)
-
-# Regression Targets strictly aligned to Classification indices
-y_train_reg = y_reg.loc[X_train.index]
-y_test_reg = y_reg.loc[X_test.index]
-
-# =============================================================================
-# 8. CLASSIFICATION MODEL BENCHMARK
-# =============================================================================
-
-classification_models = {
-    "GBM": GradientBoostingClassifier(learning_rate=0.05, max_depth=6, n_estimators=500, subsample=0.8, random_state=RANDOM_SEED),
-    "Tuned-GBM": GradientBoostingClassifier(learning_rate=0.03, max_depth=3, n_estimators=300, subsample=0.8, min_samples_leaf=5, random_state=RANDOM_SEED),
-    "Random Forest": RandomForestClassifier(n_estimators=300, max_depth=10, min_samples_split=10, bootstrap=True, random_state=RANDOM_SEED)
-}
-
-if XGBOOST_AVAILABLE:
-    classification_models["XGBoost"] = XGBClassifier(learning_rate=0.05, max_depth=5, n_estimators=400, subsample=0.8, colsample_bytree=0.8, eval_metric="logloss", random_state=RANDOM_SEED)
-
-classification_results = []
-cv = StratifiedKFold(n_splits=10, shuffle=True, random_state=RANDOM_SEED)
-fitted_classifiers = {}
-
-print("\n================ CLASSIFICATION BENCHMARK ================")
-print(f"{'Model':<15} | {'Acc':<6} | {'AUC':<6} | {'F1':<6}")
-print("-" * 45)
-
-for model_name, model in classification_models.items():
-    model.fit(X_train, y_train)
-    fitted_classifiers[model_name] = model
-
-    y_pred = model.predict(X_test)
-    y_prob = model.predict_proba(X_test)[:, 1]
-
-    holdout_acc = accuracy_score(y_test, y_pred)
-    holdout_auc = roc_auc_score(y_test, y_prob)
-    holdout_f1 = f1_score(y_test, y_pred)
-
-    cv_acc = cross_val_score(model, X_train, y_train, cv=cv, scoring="accuracy")
-    train_acc = accuracy_score(y_train, model.predict(X_train))
-
-    classification_results.append({
-        "Model": model_name,
-        "Holdout_Accuracy": holdout_acc,
-        "Holdout_AUC_ROC": holdout_auc,
-        "Holdout_F1_Score": holdout_f1,
-        "CV_Accuracy_Mean": cv_acc.mean(),
-        "CV_Accuracy_SD": cv_acc.std(),
-        "Training_Accuracy": train_acc,
-        "Train_CV_Gap": train_acc - cv_acc.mean()
-    })
-    print(f"{model_name:<15} | {holdout_acc:.3f}  | {holdout_auc:.3f}  | {holdout_f1:.3f}")
-
-safe_to_csv(pd.DataFrame(classification_results), "Classification_Model_Benchmark.csv", index=False)
-
-# =============================================================================
-# 9. PRIMARY MODEL SELECTION
-# =============================================================================
-
-PRIMARY_MODEL_NAME = "Tuned-GBM"
-primary_model = fitted_classifiers[PRIMARY_MODEL_NAME]
-
-classification_results_df = pd.DataFrame(classification_results)
-primary_metrics = classification_results_df[classification_results_df["Model"] == PRIMARY_MODEL_NAME].iloc[0]
-
-
-# =============================================================================
-# 10. REGRESSION MODEL BENCHMARK FOR CONTINUOUS DOWNTIME
-# =============================================================================
-
-regression_models = {
-    "GBM Regressor": GradientBoostingRegressor(learning_rate=0.05, max_depth=6, n_estimators=500, subsample=0.8, random_state=RANDOM_SEED),
-    "Random Forest Regressor": RandomForestRegressor(n_estimators=300, max_depth=10, min_samples_split=10, bootstrap=True, random_state=RANDOM_SEED)
-}
-
-if XGBOOST_AVAILABLE:
-    regression_models["XGBoost Regressor"] = XGBRegressor(learning_rate=0.05, max_depth=5, n_estimators=400, subsample=0.8, colsample_bytree=0.8, objective="reg:squarederror", random_state=RANDOM_SEED)
-
-regression_results = []
-print("\n================ REGRESSION BENCHMARK ================")
-print(f"{'Model':<25} | {'RMSE':<6} | {'MAE':<6} | {'R2':<6}")
-print("-" * 55)
-
-for model_name, model in regression_models.items():
-    model.fit(X_train, y_train_reg)
-    y_reg_pred = model.predict(X_test)
-    
-    model_rmse = rmse(y_test_reg, y_reg_pred)
-    model_mae = mean_absolute_error(y_test_reg, y_reg_pred)
-    model_r2 = r2_score(y_test_reg, y_reg_pred)
-    
-    regression_results.append({"Model": model_name, "RMSE_days": model_rmse, "MAE_days": model_mae, "R2": model_r2})
-    print(f"{model_name:<25} | {model_rmse:.3f}  | {model_mae:.3f}  | {model_r2:.3f}")
-
-safe_to_csv(pd.DataFrame(regression_results), "Regression_Model_Benchmark.csv", index=False)
-
-
-# =============================================================================
-# 11. PERMUTATION IMPORTANCE — PRIMARY MODEL
-# =============================================================================
-
-print("\n================ PERMUTATION IMPORTANCE (Top 5) ================")
-perm = permutation_importance(primary_model, X_test, y_test, n_repeats=30, random_state=RANDOM_SEED, scoring="accuracy")
-perm_df = pd.DataFrame({
-    "Feature": X_test.columns, 
-    "Mean_Accuracy_Drop": perm.importances_mean, 
-    "Std_Deviation": perm.importances_std
-}).sort_values("Mean_Accuracy_Drop", ascending=False)
-
-perm_df["Rank"] = np.arange(1, len(perm_df) + 1)
-safe_to_csv(perm_df[["Rank", "Feature", "Mean_Accuracy_Drop", "Std_Deviation"]], "Tuned-GBM_Permutation_Importance_All_Features.csv", index=False)
-print(perm_df[["Rank", "Feature", "Mean_Accuracy_Drop"]].head(5).to_string(index=False))
-
-
-# =============================================================================
-# 12. FEATURE ABLATION — PRIMARY MODEL
-# =============================================================================
-
-print("\n================ FEATURE ABLATION TEST ================")
-primary_physical_model = GradientBoostingClassifier(learning_rate=0.03, max_depth=3, n_estimators=300, subsample=0.8, min_samples_leaf=5, random_state=RANDOM_SEED)
-primary_physical_model.fit(X_train[physical_only_features], y_train)
-
-physical_accuracy = accuracy_score(y_test, primary_physical_model.predict(X_test[physical_only_features]))
-physical_auc = roc_auc_score(y_test, primary_physical_model.predict_proba(X_test[physical_only_features])[:, 1])
-ablation_uplift = primary_metrics["Holdout_Accuracy"] - physical_accuracy
-
-ablation_df = pd.DataFrame([
-    {"Model": "Physical/Context-only Tuned-GBM", "Holdout_Accuracy": physical_accuracy, "AUC_ROC": physical_auc},
-    {"Model": "Hybrid Tuned-GBM", "Holdout_Accuracy": primary_metrics["Holdout_Accuracy"], "AUC_ROC": primary_metrics["Holdout_AUC_ROC"]}
-])
-ablation_df["Accuracy_Improvement"] = [0.0, ablation_uplift]
-safe_to_csv(ablation_df, "Tuned-GBM_Feature_Ablation_Test.csv", index=False)
-
-print(ablation_df[["Model", "Holdout_Accuracy", "Accuracy_Improvement"]].to_string(index=False))
-
-
-# =============================================================================
-# 13. SHAP ANALYSIS — PRIMARY MODEL
-# =============================================================================
-
-if SHAP_AVAILABLE:
-    print("\n================ SHAP CATEGORY SHARES ================")
-    shap_values = safe_shap_values(primary_model, X_test)
-    mean_abs_shap = np.abs(shap_values).mean(axis=0)
-
-    shap_df = pd.DataFrame({"Feature": X_test.columns, "Mean_abs_SHAP": mean_abs_shap}).sort_values("Mean_abs_SHAP", ascending=False)
-    shap_df["Rank"] = np.arange(1, len(shap_df) + 1)
-    safe_to_csv(shap_df[["Rank", "Feature", "Mean_abs_SHAP"]], "Tuned-GBM_SHAP_MeanAbs_Importance.csv", index=False)
-
-    gov_sum = shap_df.loc[shap_df["Feature"].isin(governance_features), "Mean_abs_SHAP"].sum()
-    phys_sum = shap_df.loc[shap_df["Feature"].isin(physical_features), "Mean_abs_SHAP"].sum()
-    context_sum = shap_df.loc[shap_df["Feature"].isin(vulnerability_context_features), "Mean_abs_SHAP"].sum()
-    total_shap_sum = shap_df["Mean_abs_SHAP"].sum()
-
-    shap_category_df = pd.DataFrame([
-        {"Category": "Administrative Governance", "Mean_abs_SHAP_sum": gov_sum, "Share_of_All_Features": gov_sum / total_shap_sum},
-        {"Category": "Physical Hazards", "Mean_abs_SHAP_sum": phys_sum, "Share_of_All_Features": phys_sum / total_shap_sum},
-        {"Category": "Infrastructure Vulnerability & Context", "Mean_abs_SHAP_sum": context_sum, "Share_of_All_Features": context_sum / total_shap_sum}
-    ]).sort_values("Share_of_All_Features", ascending=False)
-    
-    safe_to_csv(shap_category_df, "Tuned-GBM_SHAP_Category_Shares.csv", index=False)
-    print(shap_category_df[["Category", "Share_of_All_Features"]].to_string(index=False))
-
-    plt.figure(figsize=(10, 6))
-    shap.summary_plot(shap_values, X_test, plot_type="dot", show=False)
-    plt.title("SHAP Beeswarm: Feature Impact on Prolonged Disruption Prediction", fontsize=13, fontweight="bold")
-    plt.xlabel("SHAP value: impact on Tuned-GBM model output")
-    plt.tight_layout()
-    for ext in ["png", "pdf", "tiff"]:
-        plt.savefig(os.path.join(OUTPUT_DIR, f"Tuned-GBM_Figure_SHAP_Beeswarm.{ext}"), dpi=600, bbox_inches="tight")
-    plt.close()
-
-
-# =============================================================================
-# 14. DGP COEFFICIENT TABLE EXPORT
-# =============================================================================
-
-dgp_coefficients = pd.DataFrame([
-    {"Term": "Governance Penalty (Severe Damage: PGA > 0.5 SD)", "Symbol": "Gov_High", "Coefficient": "Non-linear threshold", "Interpretation": "1.80(AB) - 1.20(CMI) + 0.50(AB×AA)"},
-    {"Term": "Governance Penalty (Minor Damage: PGA <= 0.5 SD)", "Symbol": "Gov_Low", "Coefficient": "Non-linear threshold", "Interpretation": "0.40(AB) - 0.30(CMI) + 0.10(AA)"},
-    {"Term": "Peak Ground Acceleration", "Symbol": "z(PGA)", "Coefficient": "1.65", "Interpretation": "Base shaking modifier"},
-    {"Term": "Peak Ground Velocity", "Symbol": "z(PGV)", "Coefficient": "0.85", "Interpretation": "Velocity increases disruption risk"},
-    {"Term": "Fault distance", "Symbol": "z(FD)", "Coefficient": "-0.70", "Interpretation": "Distance reduces disruption"},
-    {"Term": "Historical corridor downtime", "Symbol": "z(HD)", "Coefficient": "0.75", "Interpretation": "Latent fragility proxy"},
-    {"Term": "Maintenance late-cycle status", "Symbol": "MS", "Coefficient": "0.35", "Interpretation": "Vulnerability modifier"},
-    {"Term": "PGA × soft soil", "Symbol": "z(PGA) × SS", "Coefficient": "0.55", "Interpretation": "Soft soil amplifies shaking effects"},
-])
-safe_to_csv(dgp_coefficients, "DGP_NonLinear_Coefficient_Table.csv", index=False)
-
-
-# =============================================================================
-# 15. FINAL SUMMARY EXPORT
-# =============================================================================
-
-final_summary = pd.DataFrame([
-    {
-        "Primary_Model": PRIMARY_MODEL_NAME,
-        "Holdout_Accuracy": primary_metrics["Holdout_Accuracy"],
-        "Holdout_AUC_ROC": primary_metrics["Holdout_AUC_ROC"],
-        "CV_Accuracy_Mean": primary_metrics["CV_Accuracy_Mean"],
-        "CV_Accuracy_SD": primary_metrics["CV_Accuracy_SD"],
-        "Training_Accuracy": primary_metrics["Training_Accuracy"],
-        "Train_CV_Gap": primary_metrics["Train_CV_Gap"],
-        "Physical_Only_Accuracy": physical_accuracy,
-        "Hybrid_Accuracy": primary_metrics["Holdout_Accuracy"],
-        "Accuracy_Uplift": ablation_uplift
-    }
-])
-
-safe_to_csv(final_summary, "Tuned-GBM_Final_Model_Summary.csv", index=False)
-
-print("\n================ FINAL SUMMARY ================")
-print(f"Total Scenarios Generated: {N_SCENARIOS}")
-print(f"Class Balance (prolonged_disruption=1): {y_class.mean():.3f}")
-
-print(f"\nPrimary Model: {PRIMARY_MODEL_NAME}")
-print(f"  Holdout Accuracy: {primary_metrics['Holdout_Accuracy']:.3f}")
-print(f"  Holdout AUC-ROC:  {primary_metrics['Holdout_AUC_ROC']:.3f}")
-print(f"  CV Accuracy Mean: {primary_metrics['CV_Accuracy_Mean']:.3f}")
-print(f"  Train-CV Gap:     {primary_metrics['Train_CV_Gap']:.3f}")
-
-print("\nFeature Ablation (Governance Value Add):")
-print(f"  Physical-Only Baseline Accuracy: {physical_accuracy:.3f}")
-print(f"  Hybrid Model Accuracy:           {primary_metrics['Holdout_Accuracy']:.3f}")
-print(f"  Accuracy Uplift:                 {ablation_uplift:.3f}")
-
-print(f"\n[SUCCESS] All 17 outputs generated and saved in: {os.path.abspath(OUTPUT_DIR)}")
-print("================ PIPELINE COMPLETE ================\n")
+
+TARGET = 'Empirical_Downtime_Days'
+CORR = 'Operational_Corridor'
+TRI = 'Initial_Damage_Triage_Class'
+FULL = ['PGA_g', 'PGV_cms', 'Fault_Rupture_Crossing', 'Liquefaction_Severity',
+        'Track_Buckling_S_Curve', 'Bridge_Bearing_Failure', 'Equipment_Access_Blockage', TRI]
+PHYS = FULL[:-1]
+SEEDS = [42, 105, 216, 327, 438, 549, 660, 771, 882, 909]
+
+
+class FastDecisionTreeRegressor:
+    def __init__(self, max_depth=4, min_samples_split=4, min_samples_leaf=2, max_features=None, random_state=None):
+        self.max_depth = max_depth; self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf; self.max_features = max_features
+        self.random_state = random_state; self.tree = None
+
+    def fit(self, X, y):
+        rng = np.random.RandomState(self.random_state)
+        self.tree = self._build(X, y, 0, rng)
+        return self
+
+    def _build(self, X, y, depth, rng):
+        n_samples, n_features = X.shape
+        if depth >= self.max_depth or n_samples < self.min_samples_split or np.var(y) < 1e-7:
+            return ('leaf', float(np.mean(y)))
+        feat_indices = np.arange(n_features) if self.max_features is None else \
+            rng.choice(n_features, size=min(self.max_features, n_features), replace=False)
+        best_feat, best_thresh, best_score, best_left = None, None, float('inf'), None
+        y_sum, y_sq = np.sum(y), np.sum(y * y)
+        for f in feat_indices:
+            col = X[:, f]; vals = np.unique(col)
+            if len(vals) <= 1: continue
+            th = (vals[:-1] + vals[1:]) / 2.0
+            masks = col[None, :] <= th[:, None]
+            n_l = np.sum(masks, axis=1); n_r = n_samples - n_l
+            valid = (n_l >= self.min_samples_leaf) & (n_r >= self.min_samples_leaf)
+            if not np.any(valid): continue
+            mv, nl, nr, tv = masks[valid], n_l[valid], n_r[valid], th[valid]
+            sl, ql = mv @ y, mv @ (y * y); sr, qr = y_sum - sl, y_sq - ql
+            sc = (ql - sl * sl / nl) + (qr - sr * sr / nr)
+            k = int(np.argmin(sc))
+            if sc[k] < best_score - 1e-12:
+                best_score, best_feat, best_thresh, best_left = float(sc[k]), int(f), float(tv[k]), mv[k]
+        if best_feat is None: return ('leaf', float(np.mean(y)))
+        return ('node', best_feat, best_thresh,
+                self._build(X[best_left], y[best_left], depth + 1, rng),
+                self._build(X[~best_left], y[~best_left], depth + 1, rng))
+
+    def predict(self, X): return np.array([self._pred(r, self.tree) for r in X])
+
+    def _pred(self, row, node):
+        if node[0] == 'leaf': return node[1]
+        return self._pred(row, node[3]) if row[node[1]] <= node[2] else self._pred(row, node[4])
+
+
+class FastRandomForestRegressor:
+    def __init__(self, n_estimators=100, max_depth=4, min_samples_split=4, min_samples_leaf=2,
+                 max_features='sqrt', random_state=42):
+        self.n_estimators = n_estimators; self.max_depth = max_depth
+        self.min_samples_split = min_samples_split; self.min_samples_leaf = min_samples_leaf
+        self.max_features = max_features; self.random_state = random_state; self.trees = []
+
+    def fit(self, X, y):
+        rng = np.random.RandomState(self.random_state); n, p = X.shape
+        mf = max(1, int(np.sqrt(p))) if self.max_features == 'sqrt' else p
+        self.trees = []
+        for _ in range(self.n_estimators):
+            idx = rng.choice(n, size=n, replace=True); seed = rng.randint(0, 1000000)
+            t = FastDecisionTreeRegressor(self.max_depth, self.min_samples_split, self.min_samples_leaf, mf, seed)
+            self.trees.append(t.fit(X[idx], y[idx]))
+        return self
+
+    def predict(self, X): return np.mean([t.predict(X) for t in self.trees], axis=0)
+
+
+def r2_score_pure(y, p):
+    return float(1.0 - np.sum((y - p) ** 2) / np.sum((y - np.mean(y)) ** 2))
+
+
+def summarize(df, pred):
+    y = df[TARGET].values.astype(float); tri = df[TRI].values; cor = df[CORR].values
+    a = pd.DataFrame({'c': cor, 'o': y, 'p': pred}).groupby('c', sort=False).mean()
+    e = np.abs(y - pred)
+    return dict(corridor_r2=r2_score_pure(a.o.values, a.p.values), block_r2=r2_score_pure(y, pred),
+                mae=float(e.mean()), medae=float(np.median(e)), rmse=float(np.sqrt(np.mean((y - pred) ** 2))),
+                class1_mae=float(e[tri == 1].mean()), class2_mae=float(e[tri == 2].mean()))
+
+
+def evaluate_loco_rf(df, features, max_depth=4, n_estimators=100, random_state=42):
+    X = df[features].values.astype(float); y = df[TARGET].values.astype(float)
+    preds = np.zeros(len(y)); fold_models = {}; audit = []
+    for c in df[CORR].unique():
+        te = (df[CORR] == c).values; tr = ~te
+        rf = FastRandomForestRegressor(n_estimators, max_depth, 4, 2, 'sqrt', random_state).fit(X[tr], y[tr])
+        fold_models[c] = (rf, te); preds[te] = rf.predict(X[te])
+        audit.append({'Held_Out_Corridor': c, 'N_Segments': int(te.sum()),
+                      'Observed_Mean_Days': round(float(y[te].mean()), 1),
+                      'Predicted_Mean_Days': round(float(preds[te].mean()), 1),
+                      'Absolute_Error_Days': round(abs(float(y[te].mean()) - float(preds[te].mean())), 1)})
+    out = summarize(df, preds); out.update(pred=preds, fold_models=fold_models, audit_df=pd.DataFrame(audit))
+    return out
+
+
+def stump_predict(y, tri, tr, te):
+    p = np.zeros(len(y))
+    for k in (1, 2):
+        p[te & (tri == k)] = y[tr][tri[tr] == k].mean()
+    return p
+
+
+def stump_loco(df, tri=None):
+    y = df[TARGET].values.astype(float); tri = df[TRI].values if tri is None else tri; cor = df[CORR].values; p = np.zeros(len(y))
+    for c in df[CORR].unique():
+        te = cor == c; tr = ~te
+        p[te] = stump_predict(y, tri, tr, te)[te]
+    return p
+
+
+def fit_logit_l2(Z, t, C=1.0, balanced=False):
+    """min 0.5*||w||^2 + C*sum s_i*log(1+exp(-ytilde_i*(b+z_i.w))); intercept unpenalised."""
+    n, p = Z.shape; yt = np.where(t == 1, 1.0, -1.0)
+    s = np.ones(n)
+    if balanced:
+        for k in (0, 1): s[t == k] = n / (2.0 * np.sum(t == k))
+    def f(th):
+        m = yt * (th[0] + Z @ th[1:]); return 0.5 * th[1:] @ th[1:] + C * np.sum(s * np.logaddexp(0, -m))
+    def g(th):
+        m = yt * (th[0] + Z @ th[1:]); q = -s * yt / (1 + np.exp(m))
+        return np.concatenate([[C * q.sum()], th[1:] + C * Z.T @ q])
+    r = optimize.minimize(f, np.zeros(p + 1), jac=g, method='BFGS', options={'gtol': 1e-10, 'maxiter': 2000})
+    return r.x
+
+
+def predict_logit(th, Z): return 1.0 / (1.0 + np.exp(-(th[0] + Z @ th[1:])))
+
+
+def auc_score(t, s):
+    r = stats.rankdata(s); n1 = np.sum(t == 1); n0 = np.sum(t == 0)
+    return float((r[t == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def hurdle_predict(df, tr, te, mode='mean', balanced=False):
+    Xp = df[PHYS].values.astype(float); y = df[TARGET].values.astype(float); cls = (df[TRI].values == 2).astype(int)
+    mu, sd = Xp[tr].mean(0), Xp[tr].std(0); sd[sd == 0] = 1
+    Z = (Xp - mu) / sd; th = fit_logit_l2(Z[tr], cls[tr], 1.0, balanced); P = predict_logit(th, Z)
+    ly = np.log(y[tr][cls[tr] == 1]); m2, v2 = ly.mean(), ly.var()
+    c2 = {'mean': np.exp(m2 + 0.5 * v2), 'median': np.exp(m2),
+          'shifted': 365 + np.exp(np.mean(np.log(np.maximum(y[tr][cls[tr] == 1] - 365, 1))))}[mode]
+    return np.where(P >= 0.5, c2, y[tr][cls[tr] == 0].mean()), P
+
+
+def hurdle_loco(df, mode='mean', balanced=False):
+    cor = df[CORR].values; pred = np.zeros(len(df)); P = np.zeros(len(df))
+    for c in df[CORR].unique():
+        te = cor == c; tr = ~te
+        p_, P_ = hurdle_predict(df, tr, te, mode, balanced); pred[te] = p_[te]; P[te] = P_[te]
+    return pred, P
+
+
+def probit_fit(x, t):
+    X = np.c_[np.ones(len(x)), np.log(x)]
+    def nll(b):
+        q = np.clip(stats.norm.cdf(X @ b), 1e-12, 1 - 1e-12); return -np.sum(t * np.log(q) + (1 - t) * np.log(1 - q))
+    def grad(b):
+        eta = X @ b; q = np.clip(stats.norm.cdf(eta), 1e-12, 1 - 1e-12); ph = stats.norm.pdf(eta)
+        return -X.T @ (ph * (t - q) / (q * (1 - q)))
+    b = optimize.minimize(nll, np.array([0.0, 1.0]), jac=grad, method='BFGS', options={'gtol': 1e-10}).x
+    H = np.zeros((2, 2)); h = 1e-5
+    for i in range(2):
+        d = np.zeros(2); d[i] = h; H[:, i] = (grad(b + d) - grad(b - d)) / (2 * h)
+    cov = np.linalg.inv((H + H.T) / 2); b0, b1 = b
+    gt = np.array([-1 / b1, b0 / b1 ** 2]); gb = np.array([0.0, -1 / b1 ** 2])
+    p1 = np.mean(t); ll0 = len(t) * (p1 * np.log(p1) + (1 - p1) * np.log(1 - p1))
+    return dict(theta=-b0 / b1, se_theta=float(np.sqrt(gt @ cov @ gt)), beta=1 / b1, se_beta=float(np.sqrt(gb @ cov @ gb)),
+                median=float(np.exp(-b0 / b1)), mcfadden=float(1 - nll(b) / -ll0), auc=auc_score(t, stats.norm.cdf(X @ b)))
+
+
+def probit_loco(x, t, cor):
+    P = np.zeros(len(x))
+    for c in np.unique(cor):
+        te = cor == c; tr = ~te
+        X = np.c_[np.ones(tr.sum()), np.log(x[tr])]
+        def nll(b):
+            q = np.clip(stats.norm.cdf(X @ b), 1e-12, 1 - 1e-12); return -np.sum(t[tr] * np.log(q) + (1 - t[tr]) * np.log(1 - q))
+        b = optimize.minimize(nll, np.array([0.0, 1.0]), method='BFGS', options={'gtol': 1e-9}).x
+        P[te] = stats.norm.cdf(b[0] + b[1] * np.log(x[te]))
+    return P
+
+
+def bootstrap_ci(df, pred, B=1000, seed=42):
+    y = df[TARGET].values.astype(float); cor = df[CORR].values; n = len(y)
+    groups = {c: np.where(cor == c)[0] for c in df[CORR].unique()}; keys = list(groups)
+    rng = np.random.RandomState(seed); seg_r2, seg_mae = [], []
+    for _ in range(B):
+        i = rng.choice(n, n, replace=True); seg_r2.append(r2_score_pure(y[i], pred[i])); seg_mae.append(np.mean(np.abs(y[i] - pred[i])))
+    rng = np.random.RandomState(seed); clu_mae = []
+    for _ in range(B):
+        j = np.concatenate([groups[keys[k]] for k in rng.choice(len(keys), len(keys), replace=True)])
+        clu_mae.append(np.mean(np.abs(y[j] - pred[j])))
+    q = lambda a: tuple(np.round(np.percentile(a, [2.5, 97.5]), 3))
+    return dict(seg_r2_ci=q(seg_r2), seg_mae_ci=q(seg_mae), cluster_mae_ci=q(clu_mae))
+
+
+def oof_permutation(df, feats, res, seed=42, reps=10):
+    X = df[feats].values.astype(float); y = df[TARGET].values.astype(float)
+    base = res['rmse'] ** 2; rng = np.random.RandomState(seed); rec = []
+    for j, f in enumerate(feats):
+        inc = []
+        for _ in range(reps):
+            Xq = X.copy(); Xq[:, j] = rng.permutation(X[:, j]); pp = np.zeros(len(y))
+            for c, (rf, te) in res['fold_models'].items(): pp[te] = rf.predict(Xq[te])
+            inc.append((np.mean((y - pp) ** 2) - base) / base)
+        rec.append({'Feature': f, 'OOF_Mean_Delta_MSE': round(float(np.mean(inc)), 3), 'OOF_Std_Dev': round(float(np.std(inc)), 3)})
+    return pd.DataFrame(rec).sort_values('OOF_Mean_Delta_MSE', ascending=False)
+
+
+def refit_permutation(df, feats, base_rmse, seed=42, reps=10):
+    rng = np.random.RandomState(seed); base = base_rmse ** 2; rec = []
+    for f in feats:
+        inc = []
+        for _ in range(reps):
+            d2 = df.copy(); d2[f] = rng.permutation(df[f].values)
+            inc.append((evaluate_loco_rf(d2, feats)['rmse'] ** 2 - base) / base)
+        rec.append({'Feature': f, 'Refit_Mean_Delta_MSE': round(float(np.mean(inc)), 3), 'Refit_Std_Dev': round(float(np.std(inc)), 3)})
+    return pd.DataFrame(rec).sort_values('Refit_Mean_Delta_MSE', ascending=False)
+
+
+# ------------------------------------------------------------------ robustness checks
+def baseline_loco(df):
+    y = df[TARGET].values.astype(float); cor = df[CORR].values; p = np.zeros(len(y))
+    for c in df[CORR].unique():
+        te = cor == c; p[te] = y[~te].mean()
+    return p
+
+
+def skill_table(df, preds):
+    y = df[TARGET].values.astype(float); base = preds['Training-mean baseline']
+    mse_b, mae_b = np.mean((y - base) ** 2), np.mean(np.abs(y - base)); rows = []
+    for k, p in preds.items():
+        m = summarize(df, p)
+        rows.append({'Model': k, 'MAE': round(m['mae'], 1), 'RMSE': round(m['rmse'], 1), 'Block_R2': round(m['block_r2'], 3),
+                     'MSE_skill_vs_baseline': round(1 - np.mean((y - p) ** 2) / mse_b, 3), 'MAE_skill_vs_baseline': round(1 - m['mae'] / mae_b, 3)})
+    return pd.DataFrame(rows)
+
+
+def triage_label_permutation(df):
+    """Exact test: relabel which 2 of the 7 corridors are Class 1 (21 assignments) and re-run the LOCO stump."""
+    y = df[TARGET].values.astype(float); cor = df[CORR].values; corrs = list(df[CORR].unique()); rows = []
+    obs_set = set(df.loc[df[TRI] == 1, CORR].unique())
+    for pair in itertools.combinations(corrs, 2):
+        tri_p = np.where(np.isin(cor, pair), 1, 2); p = stump_loco(df, tri_p)
+        rows.append({'Class1_corridors': ' + '.join(pair), 'Observed_assignment': set(pair) == obs_set,
+                     'Block_R2': r2_score_pure(y, p), 'MAE': float(np.mean(np.abs(y - p)))})
+    t = pd.DataFrame(rows); o = t[t.Observed_assignment].iloc[0]
+    t.attrs['p_mae'] = float(np.mean(t.MAE <= o.MAE + 1e-9)); t.attrs['p_r2'] = float(np.mean(t.Block_R2 >= o.Block_R2 - 1e-12))
+    return t
+
+
+def icc_oneway(df):
+    y = df[TARGET].values.astype(float); g = df[CORR].values; N = len(y); ks = list(df[CORR].unique()); K = len(ks)
+    ni = np.array([np.sum(g == k) for k in ks]); means = np.array([y[g == k].mean() for k in ks]); gm = y.mean()
+    msb = np.sum(ni * (means - gm) ** 2) / (K - 1); msw = sum(np.sum((y[g == k] - m) ** 2) for k, m in zip(ks, means)) / (N - K)
+    k0 = (N - np.sum(ni ** 2) / N) / (K - 1); icc = (msb - msw) / (msb + (k0 - 1) * msw)
+    de = 1 + (N / K - 1) * icc
+    return dict(ICC=float(icc), design_effect=float(de), effective_N=float(N / de), mean_cluster_size=float(N / K))
+
+
+def leave_two_out(df):
+    y = df[TARGET].values.astype(float); cor = df[CORR].values; corrs = list(df[CORR].unique()); tri = df[TRI].values
+    specs = {'Ground Motion Only (RF)': ['PGA_g', 'PGV_cms'], 'Physical & Logistical (RF)': PHYS,
+             'Initial Triage & Access (RF)': [TRI, 'Equipment_Access_Blockage'], 'Full Fused (RF)': FULL}
+    acc = {k: [] for k in list(specs) + ['Decision Stump', 'Two-Stage Hurdle', 'Training-mean baseline']}; used = 0
+    for pair in itertools.combinations(corrs, 2):
+        te = np.isin(cor, pair); tr = ~te
+        if len(set(tri[tr])) < 2: continue
+        used += 1
+        for k, fs in specs.items():
+            X = df[fs].values.astype(float)
+            acc[k].append((te, FastRandomForestRegressor(100, 4, 4, 2, 'sqrt', 42).fit(X[tr], y[tr]).predict(X[te])))
+        acc['Decision Stump'].append((te, stump_predict(y, tri, tr, te)[te]))
+        acc['Two-Stage Hurdle'].append((te, hurdle_predict(df, tr, te)[0][te]))
+        acc['Training-mean baseline'].append((te, np.full(te.sum(), y[tr].mean())))
+    rows = []
+    for k, lst in acc.items():
+        maes = [np.mean(np.abs(y[te] - p)) for te, p in lst]
+        yy = np.concatenate([y[te] for te, p in lst]); pp = np.concatenate([p for te, p in lst])
+        rows.append({'Model': k, 'Pairs': used, 'Mean_pair_MAE': round(float(np.mean(maes)), 1), 'Min_pair_MAE': round(float(np.min(maes)), 1),
+                     'Max_pair_MAE': round(float(np.max(maes)), 1), 'Pooled_block_R2': round(r2_score_pure(yy, pp), 3)})
+    return pd.DataFrame(rows)
+
+
+def configure_asce_styling():
+    plt.rcParams.update({'font.family': 'sans-serif', 'font.sans-serif': ['DejaVu Sans', 'Arial', 'Helvetica'],
+        'font.size': 8.5, 'axes.labelsize': 9.0, 'axes.titlesize': 9.5, 'xtick.labelsize': 8.0, 'ytick.labelsize': 8.0,
+        'legend.fontsize': 7.8, 'lines.linewidth': 1.2, 'lines.markersize': 6.0, 'axes.linewidth': 0.8,
+        'grid.linewidth': 0.5, 'grid.color': '#d3d3d3', 'grid.linestyle': ':', 'axes.axisbelow': True})
+
+
+def save_fig(fig, out_dir, name):
+    fig.savefig(os.path.join(out_dir, name + '.png'), dpi=300); fig.savefig(os.path.join(out_dir, name + '.pdf')); plt.close(fig)
+
+
+def main():
+    in_csv = sys.argv[1] if len(sys.argv) > 1 else '06_fused_railway_disaster_dataset.csv'
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else 'output'
+    tab = os.path.join(out_dir, 'tables'); os.makedirs(tab, exist_ok=True)
+    log = open(os.path.join(out_dir, 'results_summary.txt'), 'w')
+    def say(*a):
+        s = ' '.join(str(x) for x in a); print(s); log.write(s + '\n'); log.flush()
+
+    df = pd.read_csv(in_csv)
+    if 'Procurement_Complexity' in df.columns: df = df.drop(columns=['Procurement_Complexity'])
+    y = df[TARGET].values.astype(float); cor = df[CORR].values; tri = df[TRI].values; cls = (tri == 2).astype(int)
+    corrs = list(df[CORR].unique())
+
+    say('N =', len(df), '| corridors =', len(corrs))
+    say('Outcome: mean %.1f median %.1f sd(ddof1) %.1f sd(ddof0) %.1f skew(bias-corrected) %.3f exkurt(bias-corrected) %.3f' % (
+        y.mean(), np.median(y), y.std(ddof=1), y.std(), stats.skew(y, bias=False), stats.kurtosis(y, bias=False)))
+    for k in (1, 2):
+        v = y[tri == k]; say('Class %d: n=%d mean %.1f median %.1f sd(ddof1) %.1f sd(ddof0) %.1f' % (k, len(v), v.mean(), np.median(v), v.std(ddof=1) if len(v) > 1 else 0, v.std()))
+    say(df.groupby(CORR, sort=False).agg(n=(TARGET, 'size'), PGA=('PGA_g', 'mean'), PGV=('PGV_cms', 'mean'), T=(TARGET, 'mean')).round(2).to_string())
+    sp = []
+    for f in ['PGV_cms', 'PGA_g', 'Liquefaction_Severity', 'Fault_Rupture_Crossing', 'Track_Buckling_S_Curve', 'Bridge_Bearing_Failure']:
+        r, p = stats.spearmanr(df['Equipment_Access_Blockage'], df[f]); sp.append({'Predictor': f, 'rho': round(r, 3), 'p': p})
+    pd.DataFrame(sp).to_csv(os.path.join(tab, 'spearman_access_vs_physical.csv'), index=False); say(pd.DataFrame(sp).round(4).to_string())
+    c2 = df[tri == 2]; w = []
+    for f in ['PGA_g', 'PGV_cms']:
+        r, p = stats.spearmanr(c2[f], c2[TARGET]); w.append({'Predictor': f, 'rho_within_Class2': round(r, 3), 'p': round(p, 3), 'N': len(c2)})
+    pd.DataFrame(w).to_csv(os.path.join(tab, 'spearman_within_class2.csv'), index=False); say(pd.DataFrame(w).to_string())
+    say('Shapiro-Wilk on ln(Class 2 durations): W=%.3f p=%.2e' % stats.shapiro(np.log(y[tri == 2])))
+
+    specs = {'Ground Motion Only (RF)': ['PGA_g', 'PGV_cms'], 'Physical & Logistical (RF)': PHYS,
+             'Initial Triage & Access (RF)': [TRI, 'Equipment_Access_Blockage'], 'Full Fused (RF)': FULL}
+    res = {k: evaluate_loco_rf(df, v) for k, v in specs.items()}
+    preds = {k: v['pred'] for k, v in res.items()}
+    preds['Decision Stump'] = stump_loco(df)
+    hp, hP = hurdle_loco(df, 'mean'); preds['Two-Stage Hurdle'] = hp
+    order = ['Ground Motion Only (RF)', 'Physical & Logistical (RF)', 'Two-Stage Hurdle', 'Decision Stump', 'Initial Triage & Access (RF)', 'Full Fused (RF)']
+    rows = []
+    for k in order:
+        m = summarize(df, preds[k]); m.update(bootstrap_ci(df, preds[k])); m['Model'] = k; rows.append(m)
+    t4 = pd.DataFrame(rows).set_index('Model'); t4.round(3).to_csv(os.path.join(tab, 'table4_loco_benchmark.csv'))
+    say('\nTABLE 4'); say(t4.round(3).to_string())
+
+    for mode in ('mean', 'median', 'shifted'):
+        p_, _ = hurdle_loco(df, mode); m = summarize(df, p_); say('Hurdle', mode, {k: round(v, 3) for k, v in m.items()})
+    hb, hPb = hurdle_loco(df, 'mean', True)
+    say('Stage-1 accuracy %.3f | balanced %.3f' % (np.mean((hP >= .5) == (cls == 1)), np.mean((hPb >= .5) == (cls == 1))))
+    say('Misclassified:', [(df.Segment_Name[i], round(float(hP[i]), 2)) for i in range(len(df)) if (hP[i] >= .5) != (cls[i] == 1)])
+
+    res['Full Fused (RF)']['audit_df'].to_csv(os.path.join(out_dir, '08_loco_fold_predictions_audit.csv'), index=False)
+    seg = df[['Segment_Name', CORR, 'Latitude', 'Longitude', 'PGA_g', 'PGV_cms', TRI, TARGET]].copy()
+    seg['Predicted_Downtime_Days'] = np.round(res['Full Fused (RF)']['pred'], 2)
+    seg['Absolute_Error_Days'] = np.round(np.abs(seg[TARGET] - seg['Predicted_Downtime_Days']), 2)
+    seg.to_csv(os.path.join(out_dir, '07_all_51_segments_loco_predictions.csv'), index=False)
+
+    pa = oof_permutation(df, FULL, res['Full Fused (RF)']); pb = oof_permutation(df, PHYS, res['Physical & Logistical (RF)'])
+    pa.to_csv(os.path.join(tab, 'table5_panelA_oof.csv'), index=False); pb.to_csv(os.path.join(tab, 'table5_panelB_oof.csv'), index=False)
+    say('\nTABLE 5 Panel A'); say(pa.to_string(index=False)); say('Panel B'); say(pb.to_string(index=False))
+    rf_ = refit_permutation(df, FULL, res['Full Fused (RF)']['rmse']); rf_.to_csv(os.path.join(tab, 'table5_refitting.csv'), index=False)
+    say('Refitting'); say(rf_.to_string(index=False))
+
+    sens = []
+    for d in (3, 4, 5):
+        for b in (50, 100):
+            r_ = evaluate_loco_rf(df, FULL, d, b)
+            sens.append({'max_depth': d, 'B': b, 'Corridor_R2': round(r_['corridor_r2'], 3), 'Block_R2': round(r_['block_r2'], 3),
+                         'MAE': round(r_['mae'], 1), 'RMSE': round(r_['rmse'], 1)})
+    df_sens = pd.DataFrame(sens); df_sens.to_csv(os.path.join(tab, 'tableS6_1_hyperparameters.csv'), index=False); say('\nTABLE S6-1'); say(df_sens.to_string(index=False))
+    ens = []
+    for k, v in specs.items():
+        rr = [summarize(df, evaluate_loco_rf(df, v, random_state=s)['pred']) for s in SEEDS]
+        ens.append({'Model': k, 'Corridor_R2': round(np.mean([r['corridor_r2'] for r in rr]), 3), 'Block_R2': round(np.mean([r['block_r2'] for r in rr]), 3),
+                    'MAE': round(np.mean([r['mae'] for r in rr]), 1)})
+    pd.DataFrame(ens).to_csv(os.path.join(tab, 'table4_ten_seed_means.csv'), index=False); say('\n10-seed means'); say(pd.DataFrame(ens).to_string(index=False))
+    mil = []
+    shifts = {'baseline': y.copy(), '18-segment': np.where(y == 952, 1043.0, y),
+              '21-segment': np.where(df[CORR].isin(['Golbasi_Urban', 'Narli_Pazarcik_Malatya']), 1043.0, y)}
+    for nm, yy in shifts.items():
+        d2 = df.copy(); d2[TARGET] = yy
+        for k in ['Decision Stump'] + list(specs):
+            p_ = stump_loco(d2) if k == 'Decision Stump' else evaluate_loco_rf(d2, specs[k])['pred']
+            m = summarize(d2, p_); mil.append({'Shift': nm, 'Model': k, **{a: round(b, 3) for a, b in m.items()}})
+        if nm != 'baseline':
+            rs = refit_permutation(d2, FULL, evaluate_loco_rf(d2, FULL)['rmse']); rs.to_csv(os.path.join(tab, 'table6_refitting_%s.csv' % nm), index=False)
+            say('Refitting under', nm); say(rs.to_string(index=False))
+    pd.DataFrame(mil).to_csv(os.path.join(tab, 'table6_milestone_sensitivity.csv'), index=False); say('\nTABLE 6'); say(pd.DataFrame(mil).to_string(index=False))
+
+    Xp = df[PHYS].values.astype(float); mu, sd0 = Xp.mean(0), Xp.std(0); sd1 = Xp.std(0, ddof=1)
+    th = fit_logit_l2((Xp - mu) / sd0, cls); p_in = predict_logit(th, (Xp - mu) / sd0)
+    Zd = np.c_[np.ones(len(df)), (Xp - mu) / sd0]; W = p_in * (1 - p_in)
+    H = np.diag([0] + [1.0] * len(PHYS)) + Zd.T @ (Zd * W[:, None]); se = np.sqrt(np.diag(np.linalg.inv(H)))
+    th1 = fit_logit_l2((Xp - mu) / sd1, cls)
+    ll = np.sum(cls * np.log(p_in) + (1 - cls) * np.log(1 - p_in)); p0 = cls.mean(); ll0 = len(cls) * (p0 * np.log(p0) + (1 - p0) * np.log(1 - p0))
+    raw0 = th[1:] / sd0; raw1 = th1[1:] / sd1
+    tl = pd.DataFrame({'Predictor': ['Intercept'] + PHYS, 'Mean': [np.nan] + list(mu), 'SD_ddof0': [np.nan] + list(sd0),
+        'Std_weight': th, 'Approx_SE': se, 'Raw_ddof0': [th[0] - np.sum(th[1:] * mu / sd0)] + list(raw0),
+        'Raw_ddof1': [th1[0] - np.sum(th1[1:] * mu / sd1)] + list(raw1)})
+    tl.round(4).to_csv(os.path.join(tab, 'table8_S2_1_logit.csv'), index=False)
+    Pl = np.zeros(len(df))
+    for c in corrs:
+        te = cor == c; tr = ~te; m_, s_ = Xp[tr].mean(0), Xp[tr].std(0); Zt = (Xp - m_) / s_
+        Pl[te] = predict_logit(fit_logit_l2(Zt[tr], cls[tr]), Zt[te])
+    say('\nTABLE 8 / S2-1'); say(tl.round(4).to_string(index=False))
+    say('Logit: McFadden %.3f in-sample AUC %.3f | LOCO AUC %.3f accuracy %.3f | sd(ddof1) %s | intercept(ddof1) %.3f' % (
+        1 - ll / ll0, auc_score(cls, p_in), auc_score(cls, Pl), np.mean((Pl >= .5) == (cls == 1)), np.round(sd1, 3), th1[0]))
+    pr = []
+    for f in ['PGA_g', 'PGV_cms']:
+        r = probit_fit(df[f].values, cls); Pq = probit_loco(df[f].values, cls, cor)
+        r.update(loco_auc=auc_score(cls, Pq), loco_acc=float(np.mean((Pq >= .5) == (cls == 1))), Intensity=f); pr.append(r)
+    pr = pd.DataFrame(pr); pr.round(4).to_csv(os.path.join(tab, 'table7_probit.csv'), index=False); say('\nTABLE 7'); say(pr.round(4).to_string(index=False))
+
+    # 8. robustness checks
+    allp = {'Training-mean baseline': baseline_loco(df)}; allp.update({k: preds[k] for k in order})
+    sk = skill_table(df, allp); sk.to_csv(os.path.join(tab, 'table9_baseline_skill.csv'), index=False); say('\nTABLE 9 baseline and skill'); say(sk.to_string(index=False))
+    tp = triage_label_permutation(df); tp.round(3).to_csv(os.path.join(tab, 'table10_triage_label_permutation.csv'), index=False)
+    say('\nTABLE 10 exact corridor-label permutation (21 assignments): p(MAE) = %.4f, p(R2) = %.4f' % (tp.attrs['p_mae'], tp.attrs['p_r2']))
+    say(tp.sort_values('MAE').head(5).round(3).to_string(index=False))
+    ic = icc_oneway(df); pd.DataFrame([ic]).round(4).to_csv(os.path.join(tab, 'table11_icc.csv'), index=False); say('\nTABLE 11 ICC', {k: round(v, 3) for k, v in ic.items()})
+    lt = leave_two_out(df); lt.to_csv(os.path.join(tab, 'table12_leave_two_corridors_out.csv'), index=False); say('\nTABLE 12 leave-two-corridors-out'); say(lt.to_string(index=False))
+
+    configure_asce_styling()
+    fig, ax = plt.subplots(figsize=(4.5, 3.2))
+    nm = ['Ground Motion\n(Exog P=2)', 'Physical Only\n(Exog P=7)', 'Decision Stump\n(Post-Insp P=1)', 'Triage+Access\n(Post-Insp P=2)', 'Full Fused\n(Post-Insp P=8)']
+    ks = ['Ground Motion Only (RF)', 'Physical & Logistical (RF)', 'Decision Stump', 'Initial Triage & Access (RF)', 'Full Fused (RF)']
+    c_r2 = [t4.loc[k, 'corridor_r2'] for k in ks]; b_r2 = [t4.loc[k, 'block_r2'] for k in ks]; x = np.arange(5); wd = 0.36
+    ax.bar(x - wd / 2, c_r2, wd, label='Corridor-Weighted $R^2$ ($K=7$)', color='#1f4e79', edgecolor='black', linewidth=0.6)
+    ax.bar(x + wd / 2, b_r2, wd, label='Block-Weighted $R^2$ ($N=51$)', color='#8faadc', edgecolor='black', linewidth=0.6, hatch='//')
+    ax.axhline(0, color='black', linewidth=0.8); ax.axvline(1.5, color='#c00000', linestyle='--', linewidth=0.9, label='Exogenous vs. Post-Inspection Boundary')
+    ax.set_ylabel('Out-of-Corridor Generalization $R^2$'); ax.set_xticks(x); ax.set_xticklabels(nm, rotation=15, ha='right')
+    ax.set_ylim([-0.20, 0.78]); ax.grid(True, axis='y'); ax.legend(frameon=True, facecolor='white', framealpha=0.9, edgecolor='#cccccc', loc='upper left')
+    plt.tight_layout(); save_fig(fig, out_dir, 'Figure_3_Ablation_Benchmarks')
+
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(6.5, 3.4))
+    for ax_, pdf, ttl, thr, hi in ((a1, pa, '(a) Full Fused Model ($P=8$, Masked)', 0.2, '#c00000'), (a2, pb, '(b) Physical Model ($P=7$, Unmasked)', 0.15, '#ed7d31')):
+        s_ = pdf.sort_values('OOF_Mean_Delta_MSE'); cl = ['#595959' if v <= 0 else '#2e75b6' if v < thr else hi for v in s_.OOF_Mean_Delta_MSE]
+        ax_.barh(s_.Feature, s_.OOF_Mean_Delta_MSE, xerr=s_.OOF_Std_Dev, color=cl, edgecolor='black', linewidth=0.6, height=0.65, capsize=2.5)
+        ax_.axvline(0, color='black', linewidth=0.8); ax_.set_title(ttl); ax_.set_xlabel('Leak-Free OOF $\\Delta$MSE / MSE$_{base}$'); ax_.grid(True, axis='x')
+    plt.tight_layout(); save_fig(fig, out_dir, 'Figure_4_Permutation_Importance_LeakFree')
+
+    fig, ax = plt.subplots(figsize=(6.0, 3.8)); lims = [0, 1050]
+    ax.plot(lims, lims, color='#333333', linestyle='--', linewidth=1.0, label='1:1 Parity Line')
+    ax.fill_between(lims, [v - 150 for v in lims], [v + 150 for v in lims], color='#f2f2f2', alpha=0.7, label='±150 Days Error Band')
+    sty = {"Toprakkale_Fevzipasa": ("1. Toprakkale–Fevzipaşa", "o", "#1f4e79"), "Fevzipasa_Islahiye": ("2. Fevzipaşa–İslahiye", "s", "#2e75b6"),
+           "Nurdagi_Turkoglu": ("3. Nurdağı–Türkoğlu", "^", "#c00000"), "Kopruagzi_Kahramanmaras": ("4. Köprüağzı–Kahramanmaraş", "D", "#ed7d31"),
+           "Golbasi_Urban": ("5. Lake Gölbaşı Urban Zone", "P", "#385723"), "Narli_Pazarcik_Malatya": ("6. Narlı–Pazarcık–Malatya", "v", "#7030a0"),
+           "Narli_Gaziantep": ("7. Narlı–Gaziantep Link", "X", "#595959")}
+    for _, r in res['Full Fused (RF)']['audit_df'].iterrows():
+        l, m, c = sty[r.Held_Out_Corridor]
+        ax.scatter(r.Observed_Mean_Days, r.Predicted_Mean_Days, color=c, marker=m, s=65, edgecolors='black', linewidths=0.6, label=l, zorder=4)
+    ax.set_xlabel('Observed Mean Recovery Duration (Days)'); ax.set_ylabel('Out-of-Corridor Predicted Duration (Days)')
+    ax.set_xlim(lims); ax.set_ylim(lims); ax.grid(True); ax.legend(frameon=True, facecolor='white', framealpha=0.9, edgecolor='#cccccc', loc='upper left', ncol=2)
+    plt.tight_layout(); save_fig(fig, out_dir, 'Figure_5_LOCO_Parity_Plot')
+
+    fig, ax = plt.subplots(figsize=(3.6, 3.0)); dp = [3, 4, 5]
+    ax.plot(dp, df_sens[df_sens.B == 50].Corridor_R2.tolist(), marker='o', color='#1f4e79', label='$B = 50$ Trees')
+    ax.plot(dp, df_sens[df_sens.B == 100].Corridor_R2.tolist(), marker='s', color='#c00000', linestyle='--', label='$B = 100$ Trees (Baseline)')
+    ax.set_xlabel('Maximum Decision Tree Depth (max_depth)'); ax.set_ylabel('Corridor-Weighted $R^2$'); ax.set_xticks(dp); ax.set_ylim([0.60, 0.70])
+    ax.grid(True); ax.legend(frameon=True, facecolor='white', framealpha=0.9, edgecolor='#cccccc', loc='lower right')
+    plt.tight_layout(); save_fig(fig, out_dir, 'Figure_S1_Hyperparameter_Sensitivity')
+    say('\nAll tables, figures and CSVs generated.'); log.close()
+
+
+if __name__ == '__main__':
+    main()
